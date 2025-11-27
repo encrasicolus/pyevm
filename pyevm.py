@@ -27,7 +27,7 @@ def evm(
         tuple of (return_obj, stack) where return_obj contains:
             - success: "true" or "false"
             - return: hex string of return data
-            - codecopy_logs: list of (dest_offset, code_offset, size) tuples
+            - codecopy_logs: list of (dest_offset, code_offset, size, _code, _addr) tuples
             - events: list of event logs
     """
 
@@ -39,7 +39,7 @@ def evm(
     return_data: bytes = b""  # For RETURNDATASIZE/RETURNDATACOPY
 
     highest_accessed_memory = 0
-    codecopy_logs: list[tuple[int, int, int]] = []
+    codecopy_logs: list[tuple[int, int, int, bytes, str]] = []
     events: list[dict] = []
 
     return_obj = {'highest_accessed_memory': highest_accessed_memory,
@@ -277,7 +277,11 @@ def evm(
                 memory[dest + i] = b
             if dest + size > highest_accessed_memory:
                 highest_accessed_memory = math.ceil((dest + size) / 32) * 32
-            codecopy_logs.append((dest, offset, size))
+
+            this_addr_int = int(tx.get("to", "0x0"), 16)
+            this_addr = "0x" + this_addr_int.to_bytes(20, "big").hex()
+
+            codecopy_logs.append((dest, offset, size, code, this_addr))
 
         elif next_inst == 0x3A:  # GASPRICE
             gasprice = tx.get("gasprice", "0x0")
@@ -441,9 +445,12 @@ def evm(
             offset, size = stack.popleft(), stack.popleft()
             topics = [stack.popleft() for _ in range(num_topics)]
             log_data = bytes([memory.get(offset + i, 0) for i in range(size)])
+            this_addr_int = int(tx.get("to", "0x0"), 16)
+            this_addr = "0x" + this_addr_int.to_bytes(20, "big").hex()
             events.append({
                 "topics": ["0x" + hex(t)[2:].zfill(64) for t in topics],
                 "data": log_data.hex(),
+                "address": this_addr,
             })
 
         elif next_inst in (0xF0, 0xF5):  # CREATE / CREATE2
@@ -487,6 +494,8 @@ def evm(
                 return_value, _ = evm(init_code, state, block, new_tx, external_call_always_success)
                 runtime_code = return_value.get("return", "")
                 success = return_value.get("success", False)
+                codecopy_logs.extend(return_value.get("codecopy_logs", []))
+                events.extend(return_value.get("events", []))
 
                 if success:
                     # Store the new contract in state
@@ -536,6 +545,9 @@ def evm(
                 called_return, _ = evm(calling_code, state, block, calling_tx, external_call_always_success)
                 success = called_return.get("success", False)
                 ret_hex = called_return.get("return", "")
+                codecopy_logs.extend(called_return.get("codecopy_logs", []))
+                events.extend(called_return.get("events", []))
+
                 return_data = bytes.fromhex(ret_hex) if ret_hex else b""
 
             # CALLDATACOPY / CODECOPY / EXTCODECOPY for out of bound bytes, 0s will be copied
@@ -606,6 +618,9 @@ def evm(
                 called_return, _ = evm(calling_code, state, block, calling_tx, external_call_always_success)
                 success = called_return.get("success", False)
                 ret_hex = called_return.get("return", "")
+                codecopy_logs.extend(called_return.get("codecopy_logs", []))
+                events.extend(called_return.get("events", []))
+
                 return_data = bytes.fromhex(ret_hex) if ret_hex else b""
 
             copySize = min(retSize, len(return_data))
@@ -693,11 +708,13 @@ def _test():
             break
 
         expect_constructor_codecopy_args = tuple(int(x, 16) if x.startswith("0x") else int(x) for x in test['expect'].get('constructor_codecopy_args', []))
-        constructor_codecopy_args = next(((dest, offset, size) for dest, offset, size in returned.get("codecopy_logs", []) if dest == 0), None)
-        if expect_constructor_codecopy_args and expect_constructor_codecopy_args != constructor_codecopy_args:
+        actual_constructor_codecopy_logs = [(dest, offset, size) for dest, offset, size, _, _ in returned.get("codecopy_logs", []) if dest == 0]
+        if actual_constructor_codecopy_logs:
+            print("--- --- ---", actual_constructor_codecopy_logs)
+        if expect_constructor_codecopy_args and expect_constructor_codecopy_args != next(iter(actual_constructor_codecopy_logs), None):
             print("First CODECOPY args doesn't match")
             print(" expected:", expect_constructor_codecopy_args)
-            print("   actual:", constructor_codecopy_args)
+            print("   actual:", next(iter(actual_constructor_codecopy_logs), None))
             print("")
             print("Test code:")
             print(asm)
