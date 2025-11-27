@@ -1,6 +1,7 @@
 import json
 import math
-import copy
+import collections
+from typing import Any
 
 from eth_hash.auto import keccak
 
@@ -11,7 +12,7 @@ def evm(
         block: dict,
         tx: dict,
         external_call_always_success: bool = False,
-) -> tuple[dict[str, ...], list[int]]:
+) -> tuple[dict[str, Any], list[int]]:
     """
     Execute EVM bytecode.
 
@@ -29,16 +30,17 @@ def evm(
             - codecopy_logs: list of (dest_offset, code_offset, size) tuples
             - events: list of event logs
     """
-    bytestring = code.hex()
-    stack: list[int] = []
+
+    stack: collections.deque[int] = collections.deque()
     memory: dict[int, int] = {}
     storage: dict[int, int] = {}
-    new_storage = copy.deepcopy(storage)
+    if tx.get("to") in state:
+        storage = {int(k): int(v) for k, v in state.get(tx["to"], {}).get("storage", {}).items()}  # TODO
+    return_data: bytes = b""  # For RETURNDATASIZE/RETURNDATACOPY
 
     highest_accessed_memory = 0
     codecopy_logs: list[tuple[int, int, int]] = []
     events: list[dict] = []
-    return_data: bytes = b""  # For RETURNDATASIZE/RETURNDATACOPY
 
     return_obj = {'highest_accessed_memory': highest_accessed_memory,
                   'codecopy_logs': codecopy_logs,
@@ -46,77 +48,83 @@ def evm(
     # return_obj['success'] = ...
     # return_obj['return'] = ...
 
-    while len(bytestring) > 0:
-        next_inst = int(bytestring[:2], 16)
-        bytestring = bytestring[2:]
+    cursor = 0
+    while cursor < len(code):
+        next_inst = int(code[cursor])
+        cursor += 1
 
         if next_inst == 0x00:  # STOP
-            storage = copy.deepcopy(new_storage)
-            return return_obj, stack
+            # storage = copy.deepcopy(state.get(contract_addr, {}).get("storage", {}))  # revert?
+            return return_obj, list(stack)
 
         elif next_inst == 0x01:  # ADD a b
-            result = overflower(stack[0] + stack[1])
-            stack = [result] + stack[2:]
+            result = overflower(stack.popleft() + stack.popleft())
+            stack.appendleft(result)
 
         elif next_inst == 0x02:  # MUL a b
-            result = overflower(stack[0] * stack[1])
-            stack = [result] + stack[2:]
+            result = overflower(stack.popleft() * stack.popleft())
+            stack.appendleft(result)
 
         elif next_inst == 0x03:  # SUB a b
-            result = overflower(stack[0] - stack[1])
-            stack = [result] + stack[2:]
+            result = overflower(stack.popleft() - stack.popleft())
+            stack.appendleft(result)
 
         elif next_inst == 0x04:  # DIV a b
-            if stack[1] == 0:
-                result = 0
-            else:
-                result = overflower(stack[0] // stack[1])
-            stack = [result] + stack[2:]
+            a, b = stack.popleft(), stack.popleft()
+            result = overflower(a // b) if b != 0 else 0
+            stack.appendleft(result)
 
         elif next_inst == 0x05:  # SDIV a b
-            if stack[1] == 0:
+            a, b = stack.popleft(), stack.popleft()
+            if b == 0:
                 result = 0
             else:
-                result = overflower(twos_comp(stack[0]) // twos_comp(stack[1]))
-            stack = [result] + stack[2:]
+                sa, sb = twos_comp(a), twos_comp(b)
+                # Special case: -2^255 / -1 = -2^255 (overflow, cannot represent 2^255)
+                INT_MIN = -(2 ** 255)
+                if sa == INT_MIN and sb == -1:
+                    result = a  # Return original a (which is 2^255 in unsigned = -2^255 in signed)
+                else:
+                    # Truncate toward zero (Python // rounds toward -inf, need to adjust)
+                    sign = -1 if (sa < 0) != (sb < 0) else 1
+                    result = overflower(sign * (abs(sa) // abs(sb)))
+            stack.appendleft(result)
 
         elif next_inst == 0x06:  # MOD a b
-            if stack[1] == 0:
-                result = 0
-            else:
-                result = stack[0] % stack[1]
-            stack = [result] + stack[2:]
+            a, b = stack.popleft(), stack.popleft()
+            result = overflower(a % b) if b != 0 else 0
+            stack.appendleft(result)
 
         elif next_inst == 0x07:  # SMOD a b
-            if stack[1] == 0:
+            a, b = stack.popleft(), stack.popleft()
+            if b == 0:
                 result = 0
             else:
-                result = overflower(twos_comp(stack[0]) % twos_comp(stack[1]))
-            stack = [result] + stack[2:]
+                sa, sb = twos_comp(a), twos_comp(b)
+                # Result sign follows dividend (sa), use abs for calculation
+                mod_result = abs(sa) % abs(sb)
+                if sa < 0:
+                    mod_result = -mod_result
+                result = overflower(mod_result)
+            stack.appendleft(result)
 
         elif next_inst == 0x08:  # ADDMOD a b N
-            a, b, N = stack[0], stack[1], stack[2]
-            if N == 0:
-                result = 0
-            else:
-                result = (a + b) % N
-            stack = [result] + stack[3:]
+            a, b, N = stack.popleft(), stack.popleft(), stack.popleft()
+            result = (a + b) % N if N != 0 else 0
+            stack.appendleft(result)
 
         elif next_inst == 0x09:  # MULMOD a b N
-            a, b, N = stack[0], stack[1], stack[2]
-            if N == 0:
-                result = 0
-            else:
-                result = (a * b) % N
-            stack = [result] + stack[3:]
+            a, b, N = stack.popleft(), stack.popleft(), stack.popleft()
+            result = (a * b) % N if N != 0 else 0
+            stack.appendleft(result)
 
         elif next_inst == 0x0A:  # EXP a exponent
-            base, exponent = stack[0], stack[1]
+            base, exponent = stack.popleft(), stack.popleft()
             result = overflower(pow(base, exponent, 2 ** 256))
-            stack = [result] + stack[2:]
+            stack.appendleft(result)
 
         elif next_inst == 0x0B:  # SIGNEXTEND b x
-            b, x = stack[0], stack[1]
+            b, x = stack.popleft(), stack.popleft()
             if b < 31:
                 sign_bit = 1 << (8 * b + 7)
                 mask = sign_bit - 1
@@ -127,327 +135,336 @@ def evm(
                     result = x & mask
             else:
                 result = x
-            stack = [result] + stack[2:]
+            stack.appendleft(result)
 
         elif next_inst == 0x10:  # LT a b
-            if stack[0] < stack[1]:
-                result = 1
-            else:
-                result = 0
-            stack = [result] + stack[2:]
+            a, b = stack.popleft(), stack.popleft()
+            result = int(a < b)
+            stack.appendleft(result)
 
         elif next_inst == 0x11:  # GT a b
-            if stack[0] > stack[1]:
-                result = 1
-            else:
-                result = 0
-            stack = [result] + stack[2:]
+            a, b = stack.popleft(), stack.popleft()
+            result = int(a > b)
+            stack.appendleft(result)
 
         elif next_inst == 0x12:  # SLT a b
-            if twos_comp(stack[0]) < twos_comp(stack[1]):
-                result = 1
-            else:
-                result = 0
-            stack = [result] + stack[2:]
+            a, b = stack.popleft(), stack.popleft()
+            result = int(twos_comp(a) < twos_comp(b))
+            stack.appendleft(result)
 
         elif next_inst == 0x13:  # SGT a b
-            if twos_comp(stack[0]) > twos_comp(stack[1]):
-                result = 1
-            else:
-                result = 0
-            stack = [result] + stack[2:]
+            a, b = stack.popleft(), stack.popleft()
+            result = int(twos_comp(a) > twos_comp(b))
+            stack.appendleft(result)
 
         elif next_inst == 0x14:  # EQ a b
-            if stack[0] == stack[1]:
-                result = 1
-            else:
-                result = 0
-            stack = [result] + stack[2:]
+            a, b = stack.popleft(), stack.popleft()
+            result = int(a == b)
+            stack.appendleft(result)
 
         elif next_inst == 0x15:  # ISZERO a
-            if stack[0] == 0:
-                result = 1
-            else:
-                result = 0
-            stack = [result] + stack[1:]
+            a = stack.popleft()
+            result = int(a == 0)
+            stack.appendleft(result)
 
         elif next_inst == 0x16:  # AND a b
-            result = stack[0] & stack[1]
-            stack = [result] + stack[2:]
+            result = stack.popleft() & stack.popleft()
+            stack.appendleft(result)
 
         elif next_inst == 0x17:  # OR a b
-            result = stack[0] | stack[1]
-            stack = [result] + stack[2:]
+            result = stack.popleft() | stack.popleft()
+            stack.appendleft(result)
 
         elif next_inst == 0x18:  # XOR a b
-            result = stack[0] ^ stack[1]
-            stack = [result] + stack[2:]
+            result = stack.popleft() ^ stack.popleft()
+            stack.appendleft(result)
 
         elif next_inst == 0x19:  # NOT a
-            result = overflower(~stack[0])
-            stack = [result] + stack[1:]
+            result = overflower(~stack.popleft())
+            stack.appendleft(result)
 
         elif next_inst == 0x1A:  # BYTE i x
-            if stack[0] > 32:
+            i, x = stack.popleft(), stack.popleft()
+            if i >= 32:
                 result = 0
             else:
-                result = (stack[1] >> (248 - (8 * stack[0]))) & 0xFF
-            stack = [result] + stack[2:]
+                result = (x >> (248 - (8 * i))) & 0xFF
+            stack.appendleft(result)
 
         elif next_inst == 0x1B:  # SHL shift value
-            shift, value = stack[0], stack[1]
+            shift, value = stack.popleft(), stack.popleft()
             if shift >= 256:
                 result = 0
             else:
                 result = overflower(value << shift)
-            stack = [result] + stack[2:]
+            stack.appendleft(result)
 
         elif next_inst == 0x1C:  # SHR shift value
-            shift, value = stack[0], stack[1]
+            shift, value = stack.popleft(), stack.popleft()
             if shift >= 256:
                 result = 0
             else:
                 result = value >> shift
-            stack = [result] + stack[2:]
+            stack.appendleft(result)
 
         elif next_inst == 0x1D:  # SAR shift value
-            shift, value = stack[0], stack[1]
+            shift, value = stack.popleft(), stack.popleft()
             signed_value = twos_comp(value)
             if shift >= 256:
                 result = 0 if signed_value >= 0 else overflower(-1)
             else:
                 result = overflower(signed_value >> shift)
-            stack = [result] + stack[2:]
+            stack.appendleft(result)
 
         elif next_inst == 0x20:  # SHA3 offset size (actually KECCAK256)
-            value = [memory.get(i, 0) for i in range(stack[0], stack[0] + stack[1])]
-            if stack[0] + stack[1] > highest_accessed_memory:
-                highest_accessed_memory = math.ceil((stack[0] + stack[1]) / 32) * 32
-            data = bytes(value)
+            offset, size = stack.popleft(), stack.popleft()
+            data = bytes([memory.get(i, 0) for i in range(offset, offset + size)])
+            if offset + size > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((offset + size) / 32) * 32
             result = int.from_bytes(keccak(data), "big")
-            stack = [result] + stack[2:]
+            stack.appendleft(result)
 
         elif next_inst == 0x30:  # ADDRESS
-            stack = [int(tx.get("to", '0x0'), 16)] + stack
+            result = int(tx.get("to", "0x0"), 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x31:  # BALANCE addr
-            stack = [int(state.get(hex(stack[0]), {}).get("balance", 0))] + stack[1:]
+            addr_int = stack.popleft()
+            address = "0x" + hex(addr_int)[2:].zfill(40)
+            result = int(state.get(address, {}).get("balance", 0))
+            stack.appendleft(result)
 
         elif next_inst == 0x32:  # ORIGIN
-            stack = [int(tx.get("origin", ""), 16)] + stack
+            result = int(tx.get("origin", "0x0"), 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x33:  # CALLER
-            stack = [int(tx.get("from", ""), 16)] + stack
+            result = int(tx.get("from", "0x0"), 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x34:  # CALLVALUE
-            stack = [int(tx.get("value", 0))] + stack
+            value = tx.get("value", "0x0")
+            result = value if isinstance(value, int) and value >= 0 else int(value, 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x35:  # CALLDATALOAD i
-            data = tx.get("data", "")
-            offset = stack[0]
-            data_slice = data[offset * 2:].ljust(64, "0")
-            stack = [int(data_slice[:64], 16)] + stack[1:]
+            i = stack.popleft()
+            data = bytes.fromhex(tx.get("data", "").replace("0x", ""))
+            data_slice = data[i:].ljust(32, b'\x00')[:32]
+            result = int.from_bytes(data_slice, "big")
+            stack.appendleft(result)
 
         elif next_inst == 0x36:  # CALLDATASIZE
-            stack = [len(str(tx.get("data", ""))) // 2] + stack
+            data = bytes.fromhex(tx.get("data", "").replace("0x", ""))
+            stack.appendleft(len(data))
 
         elif next_inst == 0x37:  # CALLDATACOPY destOffset offset size
-            dest_offset, data_offset, size = stack[0], stack[1], stack[2]
-            data = tx.get("data", "")
-            value = bytes.fromhex(data[data_offset * 2:(data_offset + size) * 2].ljust(size * 2, "0"))
-            for i in range(size):
-                if i < len(value):
-                    memory[dest_offset + i] = value[i]
-                else:
-                    memory[dest_offset + i] = 0
-            if dest_offset + size > highest_accessed_memory:
-                highest_accessed_memory = math.ceil(dest_offset + size)
-            stack = stack[3:]
+            dest, offset, size = stack.popleft(), stack.popleft(), stack.popleft()
+            data = bytes.fromhex(tx.get("data", "").replace("0x", ""))
+            value = data[offset: offset + size].ljust(size, b'\x00')
+            for i, b in enumerate(value):
+                memory[dest + i] = b
+            if dest + size > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((dest + size) / 32) * 32
 
         elif next_inst == 0x38:  # CODESIZE
-            stack = [len(code.hex()) // 2] + stack
+            stack.appendleft(len(code))
 
         elif next_inst == 0x39:  # CODECOPY destOffset offset size
-            dest_offset, code_offset, size = stack[0], stack[1], stack[2]
-            codecopy_logs.append((dest_offset, code_offset, size))
-            code_hex = code.hex()
-            value = bytes.fromhex(code_hex[code_offset * 2:(code_offset + size) * 2].ljust(size * 2, "0"))
-            for i in range(size):
-                if i < len(value):
-                    memory[dest_offset + i] = value[i]
-                else:
-                    memory[dest_offset + i] = 0
-            if dest_offset + size > highest_accessed_memory:
-                highest_accessed_memory = math.ceil(dest_offset + size)
-            stack = stack[3:]
+            dest, offset, size = stack.popleft(), stack.popleft(), stack.popleft()
+            value = code[offset: offset + size].ljust(size, b'\x00')
+            for i, b in enumerate(value):
+                memory[dest + i] = b
+            if dest + size > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((dest + size) / 32) * 32
+            codecopy_logs.append((dest, offset, size))
 
         elif next_inst == 0x3A:  # GASPRICE
-            stack = [int(tx.get("gasprice", 0))] + stack
+            gasprice = tx.get("gasprice", "0x0")
+            result = gasprice if isinstance(gasprice, int) and gasprice >= 0 else int(gasprice.replace("0x", ""), 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x3B:  # EXTCODESIZE addr
-            stack = [len(state.get(hex(stack[0]), {}).get("code", {}).get("bin", "")) // 2] + stack[1:]
+            addr_int = stack.popleft()
+            address = "0x" + hex(addr_int)[2:].zfill(40)
+            extcode = bytes.fromhex(state.get(address, {}).get("code", {}).get("bin", "").replace("0x", ""))
+            stack.appendleft(len(extcode))
 
         elif next_inst == 0x3C:  # EXTCODECOPY addr destOffset codeOffset size
-            addr, mem_offset, data_offset, size = stack[:4]
-            extcode = state.get(hex(addr), {}).get("code", {}).get("bin", "")
-            value = bytes.fromhex(extcode[data_offset * 2:(data_offset + size) * 2].ljust(size * 2, "0"))
-            for i in range(size):
-                if i < len(value):
-                    memory[mem_offset + i] = value[i]
-                else:
-                    memory[mem_offset + i] = 0
-            if mem_offset + size > highest_accessed_memory:
-                highest_accessed_memory = mem_offset + size
-            stack = stack[4:]
+            addr_int, dest, offset, size = stack.popleft(), stack.popleft(), stack.popleft(), stack.popleft()
+            address = "0x" + hex(addr_int)[2:].zfill(40)
+            extcode = bytes.fromhex(state.get(address, {}).get("code", {}).get("bin", "").replace("0x", ""))
+            value = extcode[offset:offset + size].ljust(size, b'\x00')
+            for i, b in enumerate(value):
+                memory[dest + i] = b
+            if dest + size > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((dest + size) / 32) * 32
 
         elif next_inst == 0x3D:  # RETURNDATASIZE
-            stack = [len(return_data)] + stack
+            stack.appendleft(len(return_data))
 
         elif next_inst == 0x3E:  # RETURNDATACOPY destOffset offset size
-            dest_offset, data_offset, size = stack[0], stack[1], stack[2]
-            for i in range(size):
-                if data_offset + i < len(return_data):
-                    memory[dest_offset + i] = return_data[data_offset + i]
-                else:
-                    memory[dest_offset + i] = 0
-            if dest_offset + size > highest_accessed_memory:
-                highest_accessed_memory = math.ceil(dest_offset + size)
-            stack = stack[3:]
+            dest, offset, size = stack.popleft(), stack.popleft(), stack.popleft()
+            if offset + size > len(return_data):
+                raise Exception('offset + size is larger than RETURNDATASIZE. (forks <EOF)')
+            value = return_data[offset:offset + size].ljust(size, b'\x00')
+            for i, b in enumerate(value):
+                memory[dest + i] = b
+            if dest + size > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((dest + size) / 32) * 32
 
         elif next_inst == 0x3F:  # EXTCODEHASH addr
-            addr = stack[0]
-            ext_code = state.get(hex(addr), {}).get("code", {}).get("bin", "")
-            if ext_code:
-                result = int.from_bytes(keccak(bytes.fromhex(ext_code)), "big")
+            addr_int = stack.popleft()
+            address = "0x" + hex(addr_int)[2:].zfill(40)
+            extcode = bytes.fromhex(state.get(address, {}).get("code", {}).get("bin", "").replace("0x", ""))
+            if extcode:
+                result = int.from_bytes(keccak(extcode), "big")
             else:
                 result = 0
-            stack = [result] + stack[1:]
+            stack.appendleft(result)
 
         elif next_inst == 0x41:  # COINBASE
-            stack = [int(block.get("coinbase", '0x0'), 16)] + stack
+            result = int(block.get("coinbase", '0x0'), 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x42:  # TIMESTAMP
-            stack = [int(block.get("timestamp", 0))] + stack
+            timestamp = block.get("timestamp", "0x0")
+            result = timestamp if isinstance(timestamp, int) and timestamp >= 0 else int(timestamp, 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x43:  # NUMBER
-            stack = [int(block.get("number", 0))] + stack
+            number = block.get("number", "0x0")
+            result = number if isinstance(number, int) and number >= 0 else int(number, 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x44:  # DIFFICULTY (PREVRANDAO after merge)
-            stack = [int(block.get("difficulty", '0x0'), 16)] + stack
+            difficulty = block.get("difficulty", "0x0")
+            result = difficulty if isinstance(difficulty, int) and difficulty >= 0 else int(difficulty, 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x45:  # GASLIMIT
-            stack = [int(block.get("gaslimit", '0x0'), 16)] + stack
+            gaslimit = block.get("gaslimit", "0x0")
+            result = gaslimit if isinstance(gaslimit, int) and gaslimit >= 0 else int(gaslimit, 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x46:  # CHAINID
-            stack = [int(block.get("chainid", 0))] + stack
+            chainid = block.get("chainid", "0x0")
+            result = chainid if isinstance(chainid, int) and chainid >= 0 else int(chainid, 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x47:  # SELFBALANCE
-            stack = [int(state.get(hex(int(tx.get("to", '0x0'), 16)), {}).get("balance", 0))] + stack
+            addr_int = int(tx.get("to", "0x0"), 16)
+            address = "0x" + hex(addr_int)[2:].zfill(40)
+            stack.appendleft(int(state.get(address, {}).get("balance", 0)))
 
         elif next_inst == 0x48:  # BASEFEE (London 2021)
-            stack = [int(block.get("basefee", 0))] + stack
+            basefee = block.get("basefee", "0x0")
+            result = basefee if isinstance(basefee, int) and basefee >= 0 else int(basefee, 16)
+            stack.appendleft(result)
 
         elif next_inst == 0x50:  # POP
-            stack = stack[1:]
+            stack.popleft()
 
         elif next_inst == 0x51:  # MLOAD offset
-            value = [memory.get(i, 0) for i in range(stack[0], stack[0] + 32)]
-            if stack[0] + 32 > highest_accessed_memory:
-                highest_accessed_memory = math.ceil((stack[0] + 32) / 32) * 32
-            hex_value = "".join([hex(i)[2:].zfill(2) for i in value]) + "00" * (32 - len(value))
-            stack = [int(hex_value, 16)] + stack[1:]
+            offset = stack.popleft()
+            value = bytes([memory.get(i, 0) for i in range(offset, offset + 32)])
+            if offset + 32 > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((offset + 32) / 32) * 32
+            result = int.from_bytes(value, "big")
+            stack.appendleft(result)
 
         elif next_inst == 0x52:  # MSTORE offset value
-            value = bytes.fromhex(hex(stack[1])[2:].zfill(64))
-            for i in range(32):
-                memory[stack[0] + i] = value[i]
-            if stack[0] + 32 > highest_accessed_memory:
-                highest_accessed_memory = math.ceil((stack[0] + 32) / 32) * 32
-            stack = stack[2:]
+            offset, value_int = stack.popleft(), stack.popleft()
+            value_hex = hex(value_int)[2:].rjust(64, "0")
+            value = bytes.fromhex(value_hex)
+            for i, b in enumerate(value):
+                memory[offset + i] = b
+            if offset + 32 > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((offset + 32) / 32) * 32
 
         elif next_inst == 0x53:  # MSTORE8 offset value
-            memory[stack[0]] = stack[1] & 0xFF
-            if stack[0] > highest_accessed_memory:
-                highest_accessed_memory = math.ceil((stack[0]) / 32) * 32
-            stack = stack[2:]
+            offset, value_int = stack.popleft(), stack.popleft()
+            memory[offset] = value_int & 0xFF
+            if offset > highest_accessed_memory:
+                highest_accessed_memory = math.ceil(offset / 32) * 32
 
         elif next_inst == 0x54:  # SLOAD key
-            stack = [new_storage.get(stack[0], 0)] + stack[1:]
+            key = stack.popleft()
+            value = int(storage.get(key, 0))
+            stack.appendleft(value)
 
         elif next_inst == 0x55:  # SSTORE key value
-            key, value = stack[:2]
-            new_storage[key] = value
-            stack = stack[2:]
+            key, value = stack.popleft(), stack.popleft()
+            storage[key] = value
 
         elif next_inst == 0x56:  # JUMP dest
-            bytestring = code.hex()[stack[0] * 2:]
-            stack = stack[1:]
-            assert bytestring[:2] == "5b", f"Invalid JUMP destination: {stack[0]}"
+            dest = stack.popleft()
+            cursor = dest
+            assert code[cursor] == 0x5b, f"Invalid JUMP destination: {dest}"
 
         elif next_inst == 0x57:  # JUMPI dest condition
-            if stack[1] > 0:
-                bytestring = code.hex()[stack[0] * 2:]
-                assert bytestring[:2] == "5b", f"Invalid JUMPI destination: {stack[0]}"
-            stack = stack[2:]
+            dest, condition = stack.popleft(), stack.popleft()
+            if condition > 0:
+                cursor = dest
+                assert code[cursor] == 0x5b, f"Invalid JUMPI destination: {dest}"
 
         elif next_inst == 0x58:  # PC
-            counter = (len(code.hex()) - (len(bytestring) + 2)) // 2
-            stack = [counter] + stack
+            stack.appendleft(cursor - 1)  # cursor already advanced past this opcode
 
         elif next_inst == 0x59:  # MSIZE
-            stack = [highest_accessed_memory] + stack
+            stack.appendleft(highest_accessed_memory)
 
         elif next_inst == 0x5A:  # GAS
-            stack = [0xFFFFFFFF] + stack  # Return large value as we don't track gas
+            stack.appendleft(0xffffffffffffffffffffffffffffffffffffffff)  # Return large value as we don't track gas
 
         elif next_inst == 0x5B:  # JUMPDEST
             pass  # No operation, just a valid jump destination marker
 
         elif next_inst == 0x5F:  # PUSH0 (Shanghai 2023)
-            stack = [0] + stack
+            stack.appendleft(0)
 
         elif 0x60 <= next_inst <= 0x7F:  # PUSH1-PUSH32
-            bytes_to_append = next_inst - 0x60 + 1
-            stack = [int(bytestring[0:bytes_to_append * 2], 16)] + stack
-            bytestring = bytestring[bytes_to_append * 2:]
+            N = next_inst - 0x60 + 1
+            stack.appendleft(int.from_bytes(code[cursor:cursor + N], "big"))
+            cursor += N
 
         elif 0x80 <= next_inst <= 0x8F:  # DUP1-DUP16
-            position_to_duplicate = next_inst - 0x80
-            stack = [stack[position_to_duplicate]] + stack
+            pos = next_inst - 0x80
+            stack.appendleft(stack[pos])
 
         elif 0x90 <= next_inst <= 0x9F:  # SWAP1-SWAP16
-            position_to_swap = next_inst - 0x90 + 1
-            stack[0], stack[position_to_swap] = stack[position_to_swap], stack[0]
+            pos = next_inst - 0x90 + 1
+            stack[0], stack[pos] = stack[pos], stack[0]
 
         elif 0xA0 <= next_inst <= 0xA4:  # LOG0-LOG4
             num_topics = next_inst - 0xA0
-            offset, size = stack[0], stack[1]
-            topics = stack[2:2 + num_topics]
+            offset, size = stack.popleft(), stack.popleft()
+            topics = [stack.popleft() for _ in range(num_topics)]
             log_data = bytes([memory.get(offset + i, 0) for i in range(size)])
             events.append({
-                "topics": [hex(t) for t in topics],
+                "topics": ["0x" + hex(t)[2:].zfill(64) for t in topics],
                 "data": log_data.hex(),
             })
-            stack = stack[2 + num_topics:]
 
         elif next_inst == 0xF0:  # CREATE value offset size
-            create_value, offset, size = stack[0], stack[1], stack[2]
+            create_value, offset, size = stack.popleft(), stack.popleft(), stack.popleft()
             # Get init code from memory
             init_code = bytes([memory.get(offset + i, 0) for i in range(size)])
 
             # Compute contract address: keccak256(rlp([sender, nonce]))[12:]
             # Simplified: use a deterministic address based on sender
-            sender_addr = int(tx.get("to", "0x0"), 16)
+            creator_int = int(tx.get("to", "0x0"), 16)
+            creator = "0x" + creator_int.to_bytes(20, "big").hex()
             # Simple nonce tracking via a counter based on code position
             nonce = 0
-            addr_preimage = sender_addr.to_bytes(20, "big") + nonce.to_bytes(8, "big")
-            new_addr = int.from_bytes(keccak(addr_preimage)[12:], "big")
+            addr_preimage = creator_int.to_bytes(20, "big") + nonce.to_bytes(8, "big")
+            new_addr = "0x" + keccak(addr_preimage)[-20:].hex()
 
             # Execute init code to get runtime code
             if init_code:
                 new_tx = {
-                    "from": tx.get("to", ""),
-                    "to": hex(new_addr),
+                    "from": creator,
+                    "to": new_addr,
                     "value": create_value,
                 }
                 [return_value, _] = evm(init_code, state, block, new_tx, external_call_always_success)
@@ -456,149 +473,158 @@ def evm(
 
                 if success:
                     # Store the new contract in state
-                    state[hex(new_addr)] = {
-                        "balance": str(create_value),
+                    state[new_addr] = {
+                        "balance": create_value,
                         "code": {"bin": runtime_code},
                     }
-                    result = new_addr
+                    result = int(new_addr, 16)
                 else:
                     result = 0
             else:
                 # Empty init code, just create an account with the value
-                state[hex(new_addr)] = {
-                    "balance": str(create_value),
+                state[new_addr] = {
+                    "balance": create_value,
                     "code": {"bin": ""},
                 }
-                result = new_addr
+                result = int(new_addr, 16)
 
-            stack = [result] + stack[3:]
+            stack.appendleft(result)
 
         elif next_inst == 0xF1:  # CALL gas addr value argsOffset argsSize retOffset retSize
-            gas, addr, value, argsOffset, argsSize, retOffset, retSize = stack[:7]
+            gas, addr_int, value, argsOffset, argsSize, retOffset, retSize = [stack.popleft() for _ in range(7)]
+
+            address = "0x" + addr_int.to_bytes(20, "big").hex()
+            this_addr_int = int(tx.get("to", "0x0"), 16)
+            this_address = "0x" + this_addr_int.to_bytes(20, "big").hex()
+
+            calldata = bytes([memory.get(pos, 0) for pos in range(argsOffset, argsOffset + argsSize)])  # 4bytes-selector + call-args
+
+            calling_code = bytes.fromhex(state.get(address, {}).get("code", {}).get("bin", ""))
 
             if external_call_always_success:
                 # Mock successful call with empty return
-                stack = [1] + stack[7:]
+                success = True
                 return_data = b"\x00" * retSize
-                for i in range(retSize):
-                    memory[retOffset + i] = 0
+            elif not calling_code:
+                # https://www.evm.codes/?fork=prague#f1 Call an account with no code will return success as true.
+                success = True
+                return_data = b''
             else:
-                called_code = bytes.fromhex(state.get(hex(addr), {}).get("code", {}).get("bin", ""))
-                old_from = tx.get("from", "")
-                tx["from"] = tx.get("to", "")
-                tx["to"] = hex(addr)
-                [return_value, _] = evm(called_code, state, block, tx, external_call_always_success)
-                tx["from"] = old_from
-                success = return_value.get("success", False)
-                ret_hex = return_value.get("return", "")
+                calling_tx = {
+                    "from": this_address,
+                    "to": address,
+                    "value": value,
+                    "data": calldata.hex()
+                }
+                called_return, _ = evm(calling_code, state, block, calling_tx, external_call_always_success)
+                success = called_return.get("success", False)
+                ret_hex = called_return.get("return", "")
                 return_data = bytes.fromhex(ret_hex) if ret_hex else b""
-                result = bytes.fromhex(ret_hex.zfill(retSize * 2)) if ret_hex else b"\x00" * retSize
 
-                if success:
-                    stack = [1] + stack[7:]
-                else:
-                    stack = [0] + stack[7:]
-
-                for i in range(min(retSize, len(result))):
-                    memory[retOffset + i] = result[i]
-
-            if retOffset + retSize > highest_accessed_memory:
-                highest_accessed_memory = retOffset + retSize
+            # CALLDATACOPY / CODECOPY / EXTCODECOPY for out of bound bytes, 0s will be copied
+            # RETURNDATACOPY will raise a revert (EIP-211)
+            # Critical: CALL's internal return data copy length is determined by **min(requestSize, returnedSize)**. No out-of-bounds check/revert occurs here.
+            ## https://github.com/ethereum/go-ethereum/blob/master/core/vm/instructions.go
+            copySize = min(retSize, len(return_data))
+            for i in range(copySize):
+                memory[retOffset + i] = return_data[i]
+            if retOffset + copySize > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((retOffset + copySize) / 32) * 32
+            stack.appendleft(int(success))
 
         elif next_inst == 0xF2:  # CALLCODE gas addr value argsOffset argsSize retOffset retSize
-            gas, addr, value, argsOffset, argsSize, retOffset, retSize = stack[:7]
-            if external_call_always_success:
-                stack = [1] + stack[7:]
-                return_data = b"\x00" * retSize
-                for i in range(retSize):
-                    memory[retOffset + i] = 0
-            else:
-                # Simplified: treat like CALL for now
-                stack = [0] + stack[7:]
-                return_data = b""
-            if retOffset + retSize > highest_accessed_memory:
-                highest_accessed_memory = retOffset + retSize
+            gas, addr_int, value, argsOffset, argsSize, retOffset, retSize = [stack.popleft() for _ in range(7)]
+
+            # TODO 实现
+            raise Exception("绝大部分情况不会用到 但后续需要实现")
 
         elif next_inst == 0xF3:  # RETURN offset size
-            offset, size = stack[:2]
-            value = [memory.get(i, 0) for i in range(offset, offset + size)]
-            result = "".join([hex(val)[2:].zfill(2) for val in value])
-            storage = copy.deepcopy(new_storage)
+            offset, size = stack.popleft(), stack.popleft()
+            value = bytes([memory.get(i, 0) for i in range(offset, offset + size)])
+            # storage = copy.deepcopy(state.get(contract_addr, {}).get("storage", {})) # revert?
             return_obj['success'] = True
-            return_obj['return'] = result  # noqa
-            return return_obj, stack[2:]
+            return_obj['return'] = value.hex()  # noqa
+            return return_obj, list(stack)
 
         elif next_inst == 0xF4:  # DELEGATECALL gas addr argsOffset argsSize retOffset retSize
-            gas, addr, argsOffset, argsSize, retOffset, retSize = stack[:6]
+            gas, addr_int, argsOffset, argsSize, retOffset, retSize = [stack.popleft() for _ in range(6)]
             if external_call_always_success:
-                stack = [1] + stack[6:]
+                success = True
                 return_data = b"\x00" * retSize
-                for i in range(retSize):
-                    memory[retOffset + i] = 0
             else:
-                # Simplified: return failure
-                stack = [0] + stack[6:]
-                return_data = b""
-            if retOffset + retSize > highest_accessed_memory:
-                highest_accessed_memory = retOffset + retSize
+                # TODO 实现
+                raise Exception("绝大部分情况不会用到 但后续需要实现")
+
+            copySize = min(retSize, len(return_data))
+            for i in range(copySize):
+                memory[retOffset + i] = return_data[i]
+            if retOffset + copySize > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((retOffset + copySize) / 32) * 32
+            stack.appendleft(int(success))
 
         elif next_inst == 0xF5:  # CREATE2 value offset size salt
-            value, offset, size, salt = stack[0], stack[1], stack[2], stack[3]
+            value, offset, size, salt = stack.popleft(), stack.popleft(), stack.popleft(), stack.popleft()
             # Simplified CREATE2: just return a placeholder address
-            result = 0x1234567890ABCDEF  # Placeholder address
-            stack = [result] + stack[4:]
+            placeholder_address = 0xffffffffffffffffffffffffffffffffffffffff  # Placeholder address
+            stack.appendleft(placeholder_address)
 
         elif next_inst == 0xFA:  # STATICCALL gas addr argsOffset argsSize retOffset retSize
-            gas, addr, argsOffset, argsSize, retOffset, retSize = stack[:6]
+            gas, addr_int, argsOffset, argsSize, retOffset, retSize = [stack.popleft() for _ in range(6)]
+
+            address = "0x" + addr_int.to_bytes(20, "big").hex()
+            this_addr_int = int(tx.get("to", "0x0"), 16)
+            this_address = "0x" + this_addr_int.to_bytes(20, "big").hex()
+
+            calldata = bytes([memory.get(pos, 0) for pos in range(argsOffset, argsOffset + argsSize)])  # 4bytes-selector + call-args
+
+            calling_code = bytes.fromhex(state.get(address, {}).get("code", {}).get("bin", ""))
+
+            # This instruction is equivalent to CALL, except that it does not allow any state modifying instructions or sending ETH
             if external_call_always_success:
-                stack = [1] + stack[6:]
+                success = True
                 return_data = b"\x00" * retSize
-                for i in range(retSize):
-                    memory[retOffset + i] = 0
+            elif not calling_code:
+                success = True
+                return_data = b''
             else:
-                called_code = bytes.fromhex(state.get(hex(addr), {}).get("code", {}).get("bin", ""))
-                old_from = tx.get("from", "")
-                tx["from"] = tx.get("to", "")
-                tx["to"] = hex(addr)
-                [return_value, _] = evm(called_code, state, block, tx, external_call_always_success)
-                tx["from"] = old_from
-                success = return_value.get("success", False)
-                ret_hex = return_value.get("return", "")
+                calling_tx = {
+                    "from": this_address,
+                    "to": address,
+                    "data": calldata.hex()
+                }
+                called_return, _ = evm(calling_code, state, block, calling_tx, external_call_always_success)
+                success = called_return.get("success", False)
+                ret_hex = called_return.get("return", "")
                 return_data = bytes.fromhex(ret_hex) if ret_hex else b""
-                result = bytes.fromhex(ret_hex.zfill(retSize * 2)) if ret_hex else b"\x00" * retSize
 
-                if success:
-                    stack = [1] + stack[6:]
-                else:
-                    stack = [0] + stack[6:]
-
-                for i in range(min(retSize, len(result))):
-                    memory[retOffset + i] = result[i]
-
-            if retOffset + retSize > highest_accessed_memory:
-                highest_accessed_memory = retOffset + retSize
+            copySize = min(retSize, len(return_data))
+            for i in range(copySize):
+                memory[retOffset + i] = return_data[i]
+            if retOffset + copySize > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((retOffset + copySize) / 32) * 32
+            stack.appendleft(int(success))
 
         elif next_inst == 0xFD:  # REVERT offset size
-            offset, size = stack[:2]
-            value = [memory.get(i, 0) for i in range(offset, offset + size)]
-            result = "".join([hex(val)[2:].zfill(2) for val in value])
+            offset, size = stack.popleft(), stack.popleft()
+            value = bytes([memory.get(i, 0) for i in range(offset, offset + size)])
+            # storage = copy.deepcopy(state.get(contract_addr, {}).get("storage", {})) # revert?
             return_obj['success'] = False
-            return_obj['return'] = result  # noqa
-            return return_obj, stack[2:]
+            return_obj['return'] = value.hex()  # noqa
+            return return_obj, list(stack)
 
         elif next_inst == 0xFE:  # INVALID
             return_obj['success'] = False
             return_obj['return'] = ""  # noqa
-            return return_obj, stack
+            return return_obj, list(stack)
 
         elif next_inst == 0xFF:  # SELFDESTRUCT addr
-            # Simplified: just consume the address
-            stack = stack[1:]
+            addr_int = stack.popleft()
+            # Simplified: just consume the address, do nothing.
 
         else:
-            raise Exception(f"Unsupported opcode: 0x{next_inst:02x} at position {(len(code.hex()) - len(bytestring) - 2) // 2}")
+            raise Exception(f"Unsupported opcode: 0x{next_inst:02x} at position {cursor - 1}")
 
-    return return_obj, stack
+    return return_obj, list(stack)
 
 
 def overflower(i: int, bits: int = 256) -> int:

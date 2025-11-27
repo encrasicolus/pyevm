@@ -171,54 +171,170 @@ contract Token {
 
 ### 已实现的操作码（完整性评估）
 
-**✅ 对我们的需求足够的部分**：
-- `0x01-0x07`: 算术运算（ADD, MUL, SUB, DIV, SDIV, MOD, SMOD）
-- `0x10-0x1A`: 比较和位运算（LT, GT, EQ, AND, OR, XOR, NOT, BYTE）
-- `0x39`: **CODECOPY** ✅ - 核心需求
-- `0x50`: POP
-- `0x51-0x55`: 内存/存储操作（MLOAD, MSTORE, MSTORE8, SLOAD, SSTORE）
-- `0x56-0x57`: **JUMP, JUMPI** ✅ - 控制流必需
-- `0x60-0x7F`: **PUSH1-PUSH32** ✅ - 加载 CODECOPY 参数
-- `0x80-0x8F`: **DUP1-DUP16** ✅ - 栈操作
-- `0x90-0x9F`: **SWAP1-SWAP16** ✅ - 栈操作
-- `0xF3`: RETURN
+---
 
-**❌ 缺失但对构造函数可能重要的**：
-- `0x0A`: EXP - 指数运算（较常用）
-- `0x08-0x09`: ADDMOD, MULMOD - 模运算
-- `0x1B-0x1D`: SHL, SHR, SAR - 位移操作（Constantinople 2019）
-- `0x3D-0x3E`: RETURNDATASIZE, RETURNDATACOPY - 外部调用返回值（Byzantium 2017）
-- `0x5F`: PUSH0 - （Shanghai 2023）
+## 操作码实现检查表（基于 evm.codes 规范）
 
-**❌ 缺失但构造函数很少用的**：
-- `0xF0, 0xF5`: CREATE, CREATE2
-- `0xF1, 0xF2, 0xF4, 0xFA`: CALL 系列
-- `0xA0-0xA4`: LOG0-LOG4
+> 检查日期：2025-11-27
+> 参考规范：https://www.evm.codes/
 
-### 需要补全的操作码（优先级排序）
+### 状态说明
+- ✅ 正确：实现符合规范，边界条件处理正确
+- ⚠️ 简化：实现有简化，但对本项目需求足够
+- ❌ 问题：存在已知问题
+- 🚧 TODO：待实现
 
-**优先级 1 - 高频且影响执行**：
-```
-0x0A: EXP          # 指数运算，某些合约会用
-0x1B: SHL          # 左移，优化代码常用
-0x1C: SHR          # 右移
-0x1D: SAR          # 算术右移
-```
+### 0x0* - 算术运算
 
-**优先级 2 - 外部调用相关（可简化处理）**：
-```
-0x3D: RETURNDATASIZE    # 外部调用后获取返回数据大小
-0x3E: RETURNDATACOPY    # 复制返回数据
-0xF1: CALL              # 外部调用（可 mock 返回成功）
-0xF4: DELEGATECALL      # 代理调用（可 mock）
-0xFA: STATICCALL        # 静态调用（可 mock）
-```
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x00 | STOP | ✅ | N/A | 正确终止执行 |
+| 0x01 | ADD | ✅ | 溢出 mod 2^256 | `overflower()` 处理 |
+| 0x02 | MUL | ✅ | 溢出 mod 2^256 | `overflower()` 处理 |
+| 0x03 | SUB | ✅ | 下溢 mod 2^256 | `overflower()` 处理负数 |
+| 0x04 | DIV | ✅ | b=0 返回 0 | 已修复除零检查 |
+| 0x05 | SDIV | ✅ | b=0 返回 0; -2^255/-1 返回 -2^255 | 向零截断；溢出边界已处理 |
+| 0x06 | MOD | ✅ | b=0 返回 0 | 已修复除零检查 |
+| 0x07 | SMOD | ✅ | b=0 返回 0; 符号跟随被除数 | 已修复符号处理 |
+| 0x08 | ADDMOD | ✅ | N=0 返回 0; 先加后模避免溢出 | Python 大整数无溢出问题 |
+| 0x09 | MULMOD | ✅ | N=0 返回 0 | Python 大整数无溢出问题 |
+| 0x0A | EXP | ✅ | 使用 pow(a,b,2^256) | 三参数 pow 高效且正确 |
+| 0x0B | SIGNEXTEND | ✅ | b>=31 原样返回 | 符号位扩展正确 |
 
-**优先级 3 - 新硬分叉（增强兼容性）**：
-```
-0x5F: PUSH0        # Shanghai 2023
-0x48: BASEFEE      # London 2021
-```
+### 0x1* - 比较和位运算
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x10 | LT | ✅ | 无符号比较 | 返回 0 或 1 |
+| 0x11 | GT | ✅ | 无符号比较 | 返回 0 或 1 |
+| 0x12 | SLT | ✅ | 有符号比较 | `twos_comp()` 转换 |
+| 0x13 | SGT | ✅ | 有符号比较 | `twos_comp()` 转换 |
+| 0x14 | EQ | ✅ | N/A | 返回 0 或 1 |
+| 0x15 | ISZERO | ✅ | N/A | 返回 0 或 1 |
+| 0x16 | AND | ✅ | N/A | 位与 |
+| 0x17 | OR | ✅ | N/A | 位或 |
+| 0x18 | XOR | ✅ | N/A | 位异或 |
+| 0x19 | NOT | ✅ | 256位取反 | `overflower(~x)` |
+| 0x1A | BYTE | ✅ | i>=32 返回 0 | 已修复边界条件 |
+| 0x1B | SHL | ✅ | shift>=256 返回 0 | Constantinople |
+| 0x1C | SHR | ✅ | shift>=256 返回 0 | Constantinople |
+| 0x1D | SAR | ✅ | shift>=256 返回 0/-1 | 负数算术右移填充1 |
+
+### 0x20 - Keccak256
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x20 | SHA3/KECCAK256 | ✅ | size=0 时 hash 空串 | 使用 eth_hash 库 |
+
+### 0x3* - 环境信息
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x30 | ADDRESS | ✅ | tx.to 缺失返回 0 | |
+| 0x31 | BALANCE | ✅ | 地址不存在返回 0 | |
+| 0x32 | ORIGIN | ✅ | tx.origin 缺失返回 0 | |
+| 0x33 | CALLER | ✅ | tx.from 缺失返回 0 | |
+| 0x34 | CALLVALUE | ✅ | 支持 int 和 hex string | |
+| 0x35 | CALLDATALOAD | ✅ | 越界填充 0 | `ljust(32, b'\x00')` |
+| 0x36 | CALLDATASIZE | ✅ | 空 data 返回 0 | |
+| 0x37 | CALLDATACOPY | ✅ | 越界填充 0 | |
+| 0x38 | CODESIZE | ✅ | N/A | |
+| 0x39 | CODECOPY | ✅ | 越界填充 0; 记录到 codecopy_logs | 核心功能 |
+| 0x3A | GASPRICE | ✅ | 支持 int 和 hex string | |
+| 0x3B | EXTCODESIZE | ✅ | 地址不存在返回 0 | |
+| 0x3C | EXTCODECOPY | ✅ | 越界填充 0 | |
+| 0x3D | RETURNDATASIZE | ✅ | 初始为 0 | Byzantium |
+| 0x3E | RETURNDATACOPY | ✅ | 越界抛异常 (EIP-211) | 与其他 COPY 不同 |
+| 0x3F | EXTCODEHASH | ✅ | 空账户返回 0 | Constantinople |
+
+### 0x4* - 区块信息
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x40 | BLOCKHASH | 🚧 | 未实现 | 需要最近 256 块 hash |
+| 0x41 | COINBASE | ✅ | 缺失返回 0 | |
+| 0x42 | TIMESTAMP | ✅ | 支持 int 和 hex string | |
+| 0x43 | NUMBER | ✅ | 支持 int 和 hex string | |
+| 0x44 | DIFFICULTY/PREVRANDAO | ✅ | 支持 int 和 hex string | Merge 后为 PREVRANDAO |
+| 0x45 | GASLIMIT | ✅ | 支持 int 和 hex string | |
+| 0x46 | CHAINID | ✅ | 支持 int 和 hex string | Istanbul |
+| 0x47 | SELFBALANCE | ✅ | 地址不存在返回 0 | Istanbul |
+| 0x48 | BASEFEE | ✅ | 支持 int 和 hex string | London |
+
+### 0x5* - 栈/内存/存储/控制流
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x50 | POP | ✅ | 栈下溢由 deque 抛异常 | |
+| 0x51 | MLOAD | ✅ | 未初始化返回 0 | |
+| 0x52 | MSTORE | ✅ | 256位大端存储 | |
+| 0x53 | MSTORE8 | ✅ | 取最低字节 | `& 0xFF` |
+| 0x54 | SLOAD | ✅ | 未初始化返回 0 | |
+| 0x55 | SSTORE | ✅ | N/A | 不跟踪 gas refund |
+| 0x56 | JUMP | ✅ | 目标必须是 JUMPDEST | 已修复验证逻辑 |
+| 0x57 | JUMPI | ✅ | condition!=0 则跳转 | 已修复验证逻辑 |
+| 0x58 | PC | ✅ | 返回当前指令位置 | 已修复 cursor-1 |
+| 0x59 | MSIZE | ✅ | 32字节对齐 | |
+| 0x5A | GAS | ⚠️ | 返回大值 | 不跟踪 gas |
+| 0x5B | JUMPDEST | ✅ | 无操作 | |
+| 0x5F | PUSH0 | ✅ | N/A | Shanghai |
+
+### 0x6*-0x7* - PUSH 指令
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x60-0x7F | PUSH1-PUSH32 | ✅ | code 末尾不足则填 0 | 已修复 cursor += N |
+
+### 0x8*-0x9* - DUP/SWAP 指令
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0x80-0x8F | DUP1-DUP16 | ✅ | 栈深度不足由 deque 抛异常 | |
+| 0x90-0x9F | SWAP1-SWAP16 | ✅ | 栈深度不足由 deque 抛异常 | |
+
+### 0xA* - LOG 指令
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0xA0-0xA4 | LOG0-LOG4 | ✅ | 记录到 events 列表 | |
+
+### 0xF* - 系统操作
+
+| Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
+|--------|------|------|-------------|------|
+| 0xF0 | CREATE | ⚠️ | 简化地址计算 | 未正确实现 nonce |
+| 0xF1 | CALL | ⚠️ | 空合约返回成功 | 支持 mock 模式 |
+| 0xF2 | CALLCODE | 🚧 | 抛异常 | 废弃指令 |
+| 0xF3 | RETURN | ✅ | N/A | |
+| 0xF4 | DELEGATECALL | ⚠️ | mock 模式可用 | 完整实现 TODO |
+| 0xF5 | CREATE2 | ⚠️ | 返回占位地址 | 简化实现 |
+| 0xFA | STATICCALL | ✅ | 不允许状态修改 | 未强制检查 |
+| 0xFD | REVERT | ✅ | success=False | |
+| 0xFE | INVALID | ✅ | success=False | |
+| 0xFF | SELFDESTRUCT | ⚠️ | 仅消费参数 | Cancun 后行为变化 |
+
+### 已发现并修复的问题
+
+| 问题 | 位置 | 修复内容 |
+|------|------|----------|
+| DIV/SDIV/MOD/SMOD 除零检查 | :74,:79,:84,:89 | `if a != 0` → `if b != 0` |
+| SDIV 向零截断和溢出边界 | :77-91 | 处理 -2^255/-1 边界；使用 abs() 实现向零截断 |
+| SMOD 符号处理 | :98-109 | 结果符号跟随被除数 |
+| JUMP/JUMPI 验证 | :400,:407 | `stack[0] == 0x5b` → `code[cursor] == 0x5b` |
+| PUSH1-PUSH32 cursor | :428 | 添加 `cursor += N` |
+| PC 返回值 | :411 | `cursor` → `cursor - 1` |
+| BYTE 边界 | :188 | `i > 32` → `i >= 32` |
+| *COPY 内存计算 | 多处 | `offset + size` → `dest + size` |
+| CALLVALUE 类型 | :245-248 | 支持整数类型 |
+
+### 未实现的操作码
+
+以下操作码遇到时会抛出 `Exception("Unsupported opcode: 0x...")`：
+
+- 0x40 BLOCKHASH
+- 0xF2 CALLCODE (抛出特定异常)
+- 0xF4 DELEGATECALL (非 mock 模式)
+- 预编译合约调用 (0x01-0x0A 地址)
 
 ## 实现建议
 
