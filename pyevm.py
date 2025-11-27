@@ -446,19 +446,36 @@ def evm(
                 "data": log_data.hex(),
             })
 
-        elif next_inst == 0xF0:  # CREATE value offset size
-            create_value, offset, size = stack.popleft(), stack.popleft(), stack.popleft()
-            # Get init code from memory
-            init_code = bytes([memory.get(offset + i, 0) for i in range(size)])
+        elif next_inst in (0xF0, 0xF5):  # CREATE / CREATE2
+            if next_inst == 0xF0:
+                # CREATE value offset size
+                create_value, offset, size = stack.popleft(), stack.popleft(), stack.popleft()
+                # Get init code from memory
+                init_code = bytes([memory.get(offset + i, 0) for i in range(size)])
 
-            # Compute contract address: keccak256(rlp([sender, nonce]))[12:]
-            # Simplified: use a deterministic address based on sender
-            creator_int = int(tx.get("to", "0x0"), 16)
-            creator = "0x" + creator_int.to_bytes(20, "big").hex()
-            # Simple nonce tracking via a counter based on code position
-            nonce = 0
-            addr_preimage = creator_int.to_bytes(20, "big") + nonce.to_bytes(8, "big")
-            new_addr = "0x" + keccak(addr_preimage)[-20:].hex()
+                # Compute contract address: keccak256(rlp([sender, nonce]))[12:]
+                # Simplified: use a deterministic address based on sender
+                creator_int = int(tx.get("to", "0x0"), 16)
+                creator = "0x" + creator_int.to_bytes(20, "big").hex()
+                # Simple nonce tracking via a counter based on code position
+                nonce = 0
+                addr_preimage = creator_int.to_bytes(20, "big") + nonce.to_bytes(8, "big")
+                new_addr = "0x" + keccak(addr_preimage)[-20:].hex()
+            else:
+                # CREATE2 value offset size salt
+                create_value, offset, size, salt = stack.popleft(), stack.popleft(), stack.popleft(), stack.popleft()
+                init_code = bytes([memory.get(offset + i, 0) for i in range(size)])
+
+                creator_int = int(tx.get("to", "0x0"), 16)
+                creator = "0x" + creator_int.to_bytes(20, "big").hex()
+                # CREATE2 address formula
+                # address = keccak256(0xff ++ sender_address ++ salt ++ keccak256(init_code))[12:]
+                prefix = bytes([0xff])
+                sender_bytes = creator_int.to_bytes(20, "big")
+                salt_bytes = salt.to_bytes(32, "big")
+                init_code_hash = keccak(init_code)
+                addr_preimage = prefix + sender_bytes + salt_bytes + init_code_hash
+                new_addr = "0x" + keccak(addr_preimage)[-20:].hex()
 
             # Execute init code to get runtime code
             if init_code:
@@ -467,7 +484,7 @@ def evm(
                     "to": new_addr,
                     "value": create_value,
                 }
-                [return_value, _] = evm(init_code, state, block, new_tx, external_call_always_success)
+                return_value, _ = evm(init_code, state, block, new_tx, external_call_always_success)
                 runtime_code = return_value.get("return", "")
                 success = return_value.get("success", False)
 
@@ -562,12 +579,6 @@ def evm(
                 highest_accessed_memory = math.ceil((retOffset + copySize) / 32) * 32
             stack.appendleft(int(success))
 
-        elif next_inst == 0xF5:  # CREATE2 value offset size salt
-            value, offset, size, salt = stack.popleft(), stack.popleft(), stack.popleft(), stack.popleft()
-            # Simplified CREATE2: just return a placeholder address
-            placeholder_address = 0xffffffffffffffffffffffffffffffffffffffff  # Placeholder address
-            stack.appendleft(placeholder_address)
-
         elif next_inst == 0xFA:  # STATICCALL gas addr argsOffset argsSize retOffset retSize
             gas, addr_int, argsOffset, argsSize, retOffset, retSize = [stack.popleft() for _ in range(6)]
 
@@ -648,20 +659,20 @@ def _test():
         print("Test #" + str(i + 1), "of", total, test['name'])
 
         code = bytes.fromhex(test['code']['bin'])
+        asm = test['code']['asm']
         tx = test.get("tx", {})
         state = test.get("state", {})
         block = test.get("block", {})
         [returned, stack] = evm(code, state, block, tx)
 
         expected_stack = [int(x, 16) if x.startswith("0x") else int(x) for x in test['expect'].get('stack', [])]
-
         if stack != expected_stack:
             print("Stack doesn't match")
             print(" expected:", expected_stack)
             print("   actual:", stack)
             print("")
             print("Test code:")
-            print(test['code']['asm'])
+            print(asm)
             print("")
             print("Progress: " + str(i) + "/" + str(len(data)))
             print("")
@@ -675,7 +686,21 @@ def _test():
             print("   actual:", return_value)
             print("")
             print("Test code:")
-            print(test['code']['asm'])
+            print(asm)
+            print("")
+            print("Progress: " + str(i) + "/" + str(len(data)))
+            print("")
+            break
+
+        expect_constructor_codecopy_args = tuple(int(x, 16) if x.startswith("0x") else int(x) for x in test['expect'].get('constructor_codecopy_args', []))
+        constructor_codecopy_args = next(((dest, offset, size) for dest, offset, size in returned.get("codecopy_logs", []) if dest == 0), None)
+        if expect_constructor_codecopy_args and expect_constructor_codecopy_args != constructor_codecopy_args:
+            print("First CODECOPY args doesn't match")
+            print(" expected:", expect_constructor_codecopy_args)
+            print("   actual:", constructor_codecopy_args)
+            print("")
+            print("Test code:")
+            print(asm)
             print("")
             print("Progress: " + str(i) + "/" + str(len(data)))
             print("")
