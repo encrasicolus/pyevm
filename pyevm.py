@@ -724,9 +724,9 @@ def _test():
                 print("--- --- ---", actual_args)
             # return 前最后一个 dest=0 的 CODECOPY 就是我们要找的
         if expect_constructor_codecopy_args and expect_constructor_codecopy_args != next(reversed(actual_constructor_codecopy_logs), None):
-            print("First CODECOPY args doesn't match")
+            print("Runtime code template CODECOPY (dest, offset, size) doesn't match")
             print(" expected:", expect_constructor_codecopy_args)
-            print("   actual:", next(iter(actual_constructor_codecopy_logs), None))
+            print("   actual:", next(reversed(actual_constructor_codecopy_logs), None))
             print("")
             print("Test code:")
             print(asm)
