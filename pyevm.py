@@ -720,8 +720,10 @@ def _test():
         expect_constructor_codecopy_args = tuple(int(x, 16) if x.startswith("0x") else int(x) for x in test['expect'].get('constructor_codecopy_args', []))
         actual_constructor_codecopy_logs = [(dest, offset, size) for dest, offset, size, _, _ in returned.get("codecopy_logs", []) if dest == 0]
         if actual_constructor_codecopy_logs:
-            print("--- --- ---", actual_constructor_codecopy_logs)
-        if expect_constructor_codecopy_args and expect_constructor_codecopy_args != next(iter(actual_constructor_codecopy_logs), None):
+            for actual_args in actual_constructor_codecopy_logs:
+                print("--- --- ---", actual_args)
+            # return 前最后一个 dest=0 的 CODECOPY 就是我们要找的
+        if expect_constructor_codecopy_args and expect_constructor_codecopy_args != next(reversed(actual_constructor_codecopy_logs), None):
             print("First CODECOPY args doesn't match")
             print(" expected:", expect_constructor_codecopy_args)
             print("   actual:", next(iter(actual_constructor_codecopy_logs), None))
