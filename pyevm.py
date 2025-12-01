@@ -573,8 +573,50 @@ def evm(
         elif next_inst == 0xF2:  # CALLCODE gas addr value argsOffset argsSize retOffset retSize
             gas, addr_int, value, argsOffset, argsSize, retOffset, retSize = [stack.popleft() for _ in range(7)]
 
-            # TODO 实现
-            raise Exception("绝大部分情况不会用到 但后续需要实现")
+            # CALLCODE: Execute code from addr, but in current contract's context
+            # - Uses current contract's storage
+            # - msg.sender = current contract (this)
+            # - msg.value = value parameter
+            address = "0x" + addr_int.to_bytes(20, "big").hex()
+            this_addr_int = int(tx.get("to", "0x0"), 16)
+            this_address = "0x" + this_addr_int.to_bytes(20, "big").hex()
+
+            calldata = bytes([memory.get(pos, 0) for pos in range(argsOffset, argsOffset + argsSize)])
+
+            calling_code = bytes.fromhex(state.get(address, {}).get("code", {}).get("bin", ""))
+
+            if external_call_always_success:
+                success = True
+                return_data = b"\x00" * retSize
+            elif not calling_code:
+                # Call to account with no code returns success
+                success = True
+                return_data = b''
+            else:
+                # Execute target's code in our context:
+                # - to = this (storage context stays with current contract)
+                # - from = this (msg.sender in callee's view)
+                # - value = value parameter (msg.value in callee's view)
+                calling_tx = {
+                    "from": this_address,
+                    "to": this_address,  # Key difference: execute in OUR context
+                    "value": value,
+                    "data": calldata.hex()
+                }
+                called_return, _ = evm(calling_code, state, block, calling_tx, external_call_always_success)
+                success = called_return.get("success", False)
+                ret_hex = called_return.get("return", "")
+                codecopy_logs.extend(called_return.get("codecopy_logs", []))
+                events.extend(called_return.get("events", []))
+
+                return_data = bytes.fromhex(ret_hex) if ret_hex else b""
+
+            copySize = min(retSize, len(return_data))
+            for i in range(copySize):
+                memory[retOffset + i] = return_data[i]
+            if retOffset + copySize > highest_accessed_memory:
+                highest_accessed_memory = math.ceil((retOffset + copySize) / 32) * 32
+            stack.appendleft(int(success))
 
         elif next_inst == 0xF3:  # RETURN offset size
             offset, size = stack.popleft(), stack.popleft()
@@ -586,12 +628,47 @@ def evm(
 
         elif next_inst == 0xF4:  # DELEGATECALL gas addr argsOffset argsSize retOffset retSize
             gas, addr_int, argsOffset, argsSize, retOffset, retSize = [stack.popleft() for _ in range(6)]
+
+            # DELEGATECALL: Execute code from addr, in current contract's context
+            # - Uses current contract's storage (via tx.to)
+            # - msg.sender = ORIGINAL caller (preserved from current tx.from)
+            # - msg.value = ORIGINAL value (preserved from current tx.value)
+            # Key difference from CALLCODE: preserves original caller and value
+            address = "0x" + addr_int.to_bytes(20, "big").hex()
+            this_addr_int = int(tx.get("to", "0x0"), 16)
+            this_address = "0x" + this_addr_int.to_bytes(20, "big").hex()
+            original_caller = tx.get("from", "0x0")
+            original_value = tx.get("value", 0)
+
+            calldata = bytes([memory.get(pos, 0) for pos in range(argsOffset, argsOffset + argsSize)])
+
+            calling_code = bytes.fromhex(state.get(address, {}).get("code", {}).get("bin", ""))
+
             if external_call_always_success:
                 success = True
                 return_data = b"\x00" * retSize
+            elif not calling_code:
+                # Call to account with no code returns success
+                success = True
+                return_data = b''
             else:
-                # TODO 实现
-                raise Exception("绝大部分情况不会用到 但后续需要实现")
+                # Execute target's code in our context, but preserve original caller/value:
+                # - to = this (storage context stays with current contract)
+                # - from = original caller (msg.sender preserved)
+                # - value = original value (msg.value preserved)
+                calling_tx = {
+                    "from": original_caller,
+                    "to": this_address,  # Execute in OUR context
+                    "value": original_value,
+                    "data": calldata.hex()
+                }
+                called_return, _ = evm(calling_code, state, block, calling_tx, external_call_always_success)
+                success = called_return.get("success", False)
+                ret_hex = called_return.get("return", "")
+                codecopy_logs.extend(called_return.get("codecopy_logs", []))
+                events.extend(called_return.get("events", []))
+
+                return_data = bytes.fromhex(ret_hex) if ret_hex else b""
 
             copySize = min(retSize, len(return_data))
             for i in range(copySize):

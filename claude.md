@@ -152,6 +152,16 @@ Init Code 流程：
 ✅ 适合计算 hash 进行相似性比对
 ```
 
+Immutable 变量布局 在Solidity/Vyper 编译器是不同的
+```csv
+特性,Solidity,Vyper
+Template 结构,Code + 占位符 + Metadata,Code + Metadata
+CODECOPY 长度,= Deployed size,< Deployed size
+Immutable 位置,原地（占位符）,追加（末尾）
+替换方式,Memory原地替换,Memory追加
+长度关系,Template = Deployed,Template < Deployed
+```
+
 ### 构造函数可以调用外部合约
 ```solidity
 // 常见模式
@@ -251,7 +261,7 @@ contract Token {
 
 | Opcode | 名称 | 状态 | 边界条件检查 | 备注 |
 |--------|------|------|-------------|------|
-| 0x40 | BLOCKHASH | 🚧 | 未实现 | 需要最近 256 块 hash |
+| 0x40 | BLOCKHASH | ⚠️ | mock 实现 | 返回 keccak256(blockNumber)，非真实链上值 |
 | 0x41 | COINBASE | ✅ | 缺失返回 0 | |
 | 0x42 | TIMESTAMP | ✅ | 支持 int 和 hex string | |
 | 0x43 | NUMBER | ✅ | 支持 int 和 hex string | |
@@ -304,9 +314,9 @@ contract Token {
 |--------|------|------|-------------|------|
 | 0xF0 | CREATE | ⚠️ | 简化地址计算 | 未正确实现 nonce |
 | 0xF1 | CALL | ⚠️ | 空合约返回成功 | 支持 mock 模式 |
-| 0xF2 | CALLCODE | 🚧 | 抛异常 | 废弃指令 |
+| 0xF2 | CALLCODE | ✅ | 在当前上下文执行目标代码 | msg.sender=this, msg.value=参数; 已废弃，推荐 DELEGATECALL |
 | 0xF3 | RETURN | ✅ | N/A | |
-| 0xF4 | DELEGATECALL | ⚠️ | mock 模式可用 | 完整实现 TODO |
+| 0xF4 | DELEGATECALL | ✅ | 在当前上下文执行目标代码 | 保留原始 msg.sender 和 msg.value |
 | 0xF5 | CREATE2 | ⚠️ | 返回占位地址 | 简化实现 |
 | 0xFA | STATICCALL | ✅ | 不允许状态修改 | 未强制检查 |
 | 0xFD | REVERT | ✅ | success=False | |
@@ -331,10 +341,11 @@ contract Token {
 
 以下操作码遇到时会抛出 `Exception("Unsupported opcode: 0x...")`：
 
-- 0x40 BLOCKHASH
-- 0xF2 CALLCODE (抛出特定异常)
-- 0xF4 DELEGATECALL (非 mock 模式)
 - 预编译合约调用 (0x01-0x0A 地址)
+
+### 简化实现的操作码
+
+- 0x40 BLOCKHASH: 返回 mock 值 (基于 block number 的 keccak256)
 
 ## 实现建议
 
@@ -412,11 +423,14 @@ elif next_inst == 0x39:  # CODECOPY destOffset offset size
 
 ## 开发清单
 
-- [ ] 理解现有实现
-- [ ] 添加 CODECOPY 捕获机制（codecopy_logs的函数内全局变量）
-- [ ] 补全缺失的高频操作码（EXP, SHL, SHR, SAR）
-- [ ] 标记缺失的非高频操作码，抛出裸 Exception(msg)
-- [ ] 添加参数允许 Mock CALL 系列调用成功返回
+- [x] 理解现有实现
+- [x] 添加 CODECOPY 捕获机制（codecopy_logs的函数内全局变量）
+- [x] 补全缺失的高频操作码（EXP, SHL, SHR, SAR）
+- [x] 标记缺失的非高频操作码，抛出裸 Exception(msg)
+- [x] 添加参数允许 Mock CALL 系列调用成功返回
+- [x] 实现 CALLCODE (0xF2) - 在当前上下文执行目标代码，msg.sender=this
+- [x] 实现 DELEGATECALL (0xF4) - 在当前上下文执行目标代码，保留原始 caller/value
+- [x] 实现 BLOCKHASH (0x40) - mock 实现，返回基于 block number 的 keccak256
 - [ ] 添加测试用例（简单合约、带 immutable、带外部调用）
 
 ## 参考资料
