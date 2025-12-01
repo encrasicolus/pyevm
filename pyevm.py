@@ -283,6 +283,13 @@ def evm(
 
             codecopy_logs.append((dest, offset, size, code, this_addr))
 
+        elif next_inst == 0x40:  # BLOCKHASH blockNumber
+            block_height = stack.popleft()
+            # Mock
+            mocked_block_hash = int.from_bytes(keccak(block_height.to_bytes(32, 'big')), "big")
+            print('Warning', 'BLOCKHASH', block_height, '=>', '<mocked_block_hash>')
+            stack.appendleft(mocked_block_hash)
+
         elif next_inst == 0x3A:  # GASPRICE
             gasprice = tx.get("gasprice", "0x0")
             result = gasprice if isinstance(gasprice, int) and gasprice >= 0 else int(gasprice.replace("0x", ""), 16)
@@ -419,6 +426,7 @@ def evm(
             stack.appendleft(highest_accessed_memory)
 
         elif next_inst == 0x5A:  # GAS
+            print('Warning', 'GAS', '=>', '<infinity_gas>', "Return large value as we don't track gas")
             stack.appendleft(0xffffffffffffffffffffffffffffffffffffffff)  # Return large value as we don't track gas
 
         elif next_inst == 0x5B:  # JUMPDEST
@@ -466,6 +474,7 @@ def evm(
                 creator = "0x" + creator_int.to_bytes(20, "big").hex()
                 # Simple nonce tracking via a counter based on code position
                 nonce = 0
+                print('Warning', 'CREATE', 'always nonce=0')
                 addr_preimage = creator_int.to_bytes(20, "big") + nonce.to_bytes(8, "big")
                 new_addr = "0x" + keccak(addr_preimage)[-20:].hex()
             else:
@@ -645,6 +654,7 @@ def evm(
 
         elif next_inst == 0xFF:  # SELFDESTRUCT addr
             addr_int = stack.popleft()
+            print('Warning', 'SELFDESTRUCT', 'do nothing')
             # Simplified: just consume the address, do nothing.
 
         else:
